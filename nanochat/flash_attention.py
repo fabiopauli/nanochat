@@ -58,14 +58,26 @@ def _use_fa3():
 # =============================================================================
 # SDPA helpers
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_bias=None):
     """
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
+    attn_bias: optional (B, Tq, Tk) float tensor of entity bias added to attention logits.
     """
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
+
+    # When attn_bias is provided, build combined causal + entity bias mask (float)
+    if attn_bias is not None:
+        device, dtype = q.device, q.dtype
+        row_idx = torch.arange(Tq, device=device).unsqueeze(1)
+        col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+        causal_mask = torch.zeros(Tq, Tk, device=device, dtype=dtype)
+        causal_mask.masked_fill_(col_idx > row_idx, float('-inf'))
+        # attn_bias: (B, Tq, Tk) -> (B, 1, Tq, Tk)
+        combined = causal_mask.unsqueeze(0).unsqueeze(0) + attn_bias.unsqueeze(1)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=combined, enable_gqa=enable_gqa)
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
@@ -90,13 +102,13 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     # sliding window (left)
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
-    
+
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), attn_bias=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -104,11 +116,13 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        attn_bias: optional (B, T, T) float tensor added to attention logits (SDPA path only).
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
     if _use_fa3():
+        # FA3 (Hopper only) does not support attn_bias; ignore it
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -116,7 +130,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa, attn_bias=attn_bias)
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 

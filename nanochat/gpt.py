@@ -37,11 +37,32 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Entity injection (nstc.py experiment, disabled by default)
+    n_entities: int = 0        # 0=disabled; >0 enables progressive entity injection
+    entity_temp: float = 0.5   # softmax temperature for entity assignments
+    scale0_cap: float = 0.15   # cap for inject_scales[0] (v16 sweep best: 0.12-0.15)
 
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
+
+
+class EntityProjection(nn.Module):
+    """Soft entity assignment per token (nstc.py progressive injection)."""
+    def __init__(self, n_embd, n_entities, entity_temp=0.5):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embd, n_embd, bias=False)
+        self.fc2 = nn.Linear(n_embd, n_entities, bias=False)
+        self.temp = entity_temp
+
+    def forward(self, h, hard=False):
+        logits = self.fc2(F.silu(self.fc1(h)))
+        if hard:
+            idx = logits.argmax(-1, keepdim=True)
+            y = torch.zeros_like(logits).scatter_(-1, idx, 1.0)
+            return y - logits.detach() + logits
+        return F.softmax(logits / self.temp, dim=-1)
 
 
 def has_ve(layer_idx, n_layer):
@@ -73,7 +94,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, entity_bias=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -97,7 +118,7 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, attn_bias=entity_bias)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -137,8 +158,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, entity_bias=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, entity_bias=entity_bias)
         x = x + self.mlp(norm(x))
         return x
 
@@ -171,6 +192,14 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # Progressive entity injection (nstc.py, disabled when n_entities=0)
+        if config.n_entities > 0:
+            self.entity_proj = EntityProjection(config.n_embd, config.n_entities, config.entity_temp)
+            self.gate_logit = nn.Parameter(torch.tensor(-1.0))  # fake init
+            self.inject_scales = nn.ParameterList([
+                nn.Parameter(torch.tensor(0.0)),  # scale₀ (capped)
+                nn.Parameter(torch.tensor(0.0)),  # scale₁ (uncapped)
+            ])
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -228,6 +257,14 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # Entity injection parameters
+        if hasattr(self, 'entity_proj'):
+            torch.nn.init.uniform_(self.entity_proj.fc1.weight, -s, s)
+            torch.nn.init.uniform_(self.entity_proj.fc2.weight, -s, s)
+            self.gate_logit.fill_(-1.0)
+            for scale in self.inject_scales:
+                scale.fill_(0.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -334,7 +371,12 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        entity_params = 0
+        if self.config.n_entities > 0:
+            entity_params = (sum(p.numel() for p in self.entity_proj.parameters()) +
+                             self.gate_logit.numel() +
+                             sum(p.numel() for p in self.inject_scales.parameters()))
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + entity_params
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -351,12 +393,18 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
+        if self.config.n_entities > 0:
+            matrix_params += list(self.entity_proj.parameters())  # 2D weights -> Muon
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        entity_scalar_params = list(self.inject_scales.parameters()) + [self.gate_logit] if self.config.n_entities > 0 else []
+        expected = (len(matrix_params) + len(embedding_params) + len(lm_head_params) +
+                    len(value_embeds_params) + len(resid_params) + len(x0_params) +
+                    len(entity_scalar_params))
+        assert len(list(self.parameters())) == expected, f"Parameter count mismatch: {len(list(self.parameters()))} != {expected}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -368,7 +416,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=resid_params + entity_scalar_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
@@ -400,10 +448,32 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        entity_bias_next = None
+        ep_last = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, entity_bias=entity_bias_next)
+            # Progressive injection: compute bias for next block (only after blocks 0 and 1)
+            if self.config.n_entities > 0 and i < 2:
+                ep = self.entity_proj(norm(x))
+                ep_last = ep
+                bias = torch.bmm(ep, ep.transpose(-1, -2))
+                if i == 0:
+                    s = self.inject_scales[0].clamp(0.0, self.config.scale0_cap)
+                else:
+                    s = self.inject_scales[1]
+                entity_bias_next = bias * s
+            else:
+                entity_bias_next = None
+        # Slot binding (after all blocks)
+        if self.config.n_entities > 0 and ep_last is not None:
+            assign_t = ep_last.transpose(-1, -2)                          # (B, n_entities, T)
+            weights = assign_t / (assign_t.sum(-1, keepdim=True) + 1e-8)  # normalize
+            slots = torch.bmm(weights, x)                                  # (B, n_entities, d)
+            readout = torch.bmm(ep_last, slots)                            # (B, T, d)
+            g = torch.sigmoid(self.gate_logit)
+            x = (1.0 - g) * x + g * readout
         x = norm(x)
 
         # Forward the lm_head (compute logits)
